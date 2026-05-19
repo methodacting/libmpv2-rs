@@ -175,7 +175,20 @@ impl<C> From<RenderParam<C>> for libmpv2_sys::mpv_render_param {
             RenderParam::FlipY(flip) => Box::into_raw(Box::new(flip as c_int)) as *mut c_void,
             RenderParam::Depth(depth) => Box::into_raw(Box::new(depth)) as *mut c_void,
             RenderParam::ICCProfile(bytes) => {
-                Box::into_raw(bytes.into_boxed_slice()) as *mut c_void
+                // MPV_RENDER_PARAM_ICC_PROFILE expects `mpv_byte_array*`
+                // (a {data, size} struct), not a raw byte buffer. The fat
+                // pointer cast `*mut [u8] as *mut c_void` discards the slice
+                // length, leaving mpv to read garbage size. Build a proper
+                // `mpv_byte_array` whose data field points into the heap
+                // buffer; the matching deleter reclaims both.
+                let boxed = bytes.into_boxed_slice();
+                let size = boxed.len();
+                let data_ptr = Box::into_raw(boxed) as *mut u8;
+                let ba = libmpv2_sys::mpv_byte_array {
+                    data: data_ptr as *mut c_void,
+                    size,
+                };
+                Box::into_raw(Box::new(ba)) as *mut c_void
             }
             RenderParam::AmbientLight(lux) => Box::into_raw(Box::new(lux)) as *mut c_void,
             RenderParam::X11Display(ptr) => ptr as *mut _,
@@ -201,6 +214,20 @@ unsafe fn free_void_data<T>(ptr: *mut c_void) {
     drop(unsafe { Box::<T>::from_raw(ptr as *mut T) });
 }
 
+/// Reclaim both the `mpv_byte_array` heap box and the underlying ICC profile
+/// buffer it points into. Paired with the `ICCProfile` arm of
+/// `mpv_render_param::from(RenderParam)`.
+unsafe fn free_icc_profile(ptr: *mut c_void) {
+    let ba_box: Box<libmpv2_sys::mpv_byte_array> =
+        unsafe { Box::from_raw(ptr as *mut libmpv2_sys::mpv_byte_array) };
+    if !ba_box.data.is_null() && ba_box.size > 0 {
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(ba_box.data as *mut u8, ba_box.size)
+        };
+        drop(unsafe { Box::from_raw(slice as *mut [u8]) });
+    }
+}
+
 unsafe fn free_init_params<C: 'static>(ptr: *mut c_void) {
     let params = unsafe { Box::from_raw(ptr as *mut libmpv2_sys::mpv_opengl_init_params) };
     drop(unsafe { Box::from_raw(params.get_proc_address_ctx as *mut OpenGLInitParams<C>) });
@@ -224,7 +251,7 @@ impl Mpv {
                 RenderParam::FBO(_) => Some(free_void_data::<FBO>),
                 RenderParam::FlipY(_) => Some(free_void_data::<i32>),
                 RenderParam::Depth(_) => Some(free_void_data::<i32>),
-                RenderParam::ICCProfile(_) => Some(free_void_data::<Box<[u8]>>),
+                RenderParam::ICCProfile(_) => Some(free_icc_profile),
                 RenderParam::AmbientLight(_) => Some(free_void_data::<i32>),
                 RenderParam::NextFrameInfo(_) => Some(free_void_data::<RenderFrameInfo>),
                 _ => None,
