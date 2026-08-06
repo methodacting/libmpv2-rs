@@ -14,6 +14,26 @@ pub struct RenderContext<'a> {
     _marker: PhantomData<&'a Mpv>,
 }
 
+/// See [RenderContext::swap_token]. Obtainable only through that (unsafe)
+/// method; the safety contract lives there.
+#[derive(Clone, Copy)]
+pub struct SwapToken {
+    ctx: *mut libmpv2_sys::mpv_render_context,
+}
+
+// SAFETY: mpv_render_context_report_swap is documented as callable from any
+// thread while the render context is alive; liveness is the token creator's
+// obligation (see swap_token).
+unsafe impl Send for SwapToken {}
+unsafe impl Sync for SwapToken {}
+
+impl SwapToken {
+    /// See [RenderContext::report_swap]. Call once per display vsync.
+    pub fn report_swap(&self) {
+        unsafe { libmpv2_sys::mpv_render_context_report_swap(self.ctx) }
+    }
+}
+
 /// For initializing the mpv OpenGL state via [RenderParam::InitParams]
 pub struct OpenGLInitParams<GLContext: 'static> {
     /// This retrieves OpenGL function pointers, and will use them in subsequent
@@ -400,6 +420,49 @@ impl<'a> RenderContext<'a> {
         }
 
         ret
+    }
+
+    /// Perform a "skip rendering" pass: consumes the pending frame and advances
+    /// mpv's playback clock without touching the framebuffer. Call this instead
+    /// of [render](Self::render) when a frame is due but drawing is suppressed
+    /// (hidden layer, window animation) — with `MPV_RENDER_PARAM_ADVANCED_CONTROL`
+    /// enabled, silently not rendering makes mpv's core back up on the client.
+    ///
+    /// The GL context must be current on the calling thread, like for `render`.
+    pub fn render_skip<GLContext: 'static>(&self) -> Result<()> {
+        let raw_param: libmpv2_sys::mpv_render_param =
+            RenderParam::<GLContext>::SkipRendering(true).into();
+        let data_ptr = raw_param.data;
+        let mut raw_params = [
+            raw_param,
+            libmpv2_sys::mpv_render_param {
+                type_: 0,
+                data: ptr::null_mut(),
+            },
+        ];
+
+        let ret = unsafe {
+            mpv_err(
+                (),
+                libmpv2_sys::mpv_render_context_render(self.ctx, raw_params.as_mut_ptr()),
+            )
+        };
+        unsafe { free_void_data::<c_int>(data_ptr) };
+        ret
+    }
+
+    /// A `Send + Sync` handle that can report swaps from any thread (e.g. a
+    /// CVDisplayLink callback) without going through whatever lock guards the
+    /// `RenderContext` itself — `mpv_render_context_report_swap` is documented
+    /// as callable from any thread.
+    ///
+    /// # Safety
+    ///
+    /// The token borrows the underlying `mpv_render_context` without a
+    /// lifetime: the caller must guarantee no calls happen after the
+    /// `RenderContext` is dropped.
+    pub unsafe fn swap_token(&self) -> SwapToken {
+        SwapToken { ctx: self.ctx }
     }
 
     /// Tell the renderer that a frame was flipped at the given time. This is
