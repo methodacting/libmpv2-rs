@@ -541,11 +541,14 @@ impl<'a> RenderContext<'a> {
 
 impl Drop for RenderContext<'_> {
     fn drop(&mut self) {
-        if let Some(update_callback_cleanup) = self.update_callback_cleanup.take() {
-            update_callback_cleanup();
-        }
+        // Free the context first: it tears down the VO, after which mpv can no
+        // longer invoke the update callback. Freeing the callback before that
+        // lets the VO thread call into freed memory.
         unsafe {
             libmpv2_sys::mpv_render_context_free(self.ctx);
+        }
+        if let Some(update_callback_cleanup) = self.update_callback_cleanup.take() {
+            update_callback_cleanup();
         }
     }
 }
